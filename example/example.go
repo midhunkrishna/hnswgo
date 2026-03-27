@@ -8,7 +8,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/oligo/hnswgo"
+	"github.com/midhunkrishna/hnswgo"
 )
 
 func main() {

@@ -1,0 +1,4 @@
+Source: https://github.com/nmslib/hnswlib
+Version: v0.8.0 (approximate)
+Notes: Vendored copy of header-only library. Contains PR #508 (custom error stream).
+       Do not modify directly; update from upstream when needed.
