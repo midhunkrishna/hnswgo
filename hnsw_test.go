@@ -236,6 +236,65 @@ func TestGetVectorData(t *testing.T) {
 	}
 }
 
+func TestGetDataByLabelRoundTrip(t *testing.T) {
+	for _, st := range []struct {
+		name      string
+		spaceType SpaceType
+	}{
+		{"L2", L2},
+		{"IP", IP},
+		{"Cosine", Cosine},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			testDim := 16
+			index, err := New(testDim, 16, 200, 42, 100, st.spaceType, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer index.Free()
+
+			vec := make([]float32, testDim)
+			for i := range vec {
+				vec[i] = float32(i+1) * 0.1
+			}
+			label := uint64(42)
+			if err := index.AddPoints([][]float32{vec}, []uint64{label}, 1, false); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := index.GetDataByLabel(label)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(got) != testDim {
+				t.Fatalf("expected len %d, got %d", testDim, len(got))
+			}
+
+			if st.spaceType == Cosine {
+				// Cosine normalizes on insert, so we verify non-zero values
+				// but cannot compare to the original vector directly.
+				allZero := true
+				for _, v := range got {
+					if v != 0 {
+						allZero = false
+						break
+					}
+				}
+				if allZero {
+					t.Error("expected non-zero normalized vector for Cosine space")
+				}
+			} else {
+				for i := range vec {
+					if got[i] != vec[i] {
+						t.Errorf("dim %d: got %f, want %f", i, got[i], vec[i])
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestErrorPaths(t *testing.T) {
 	t.Run("GetDataByLabel_missing_label", func(t *testing.T) {
 		index, err := New(8, 16, 200, 42, 10, L2, false)
