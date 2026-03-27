@@ -174,11 +174,17 @@ func (idx *HnswIndex) AddPoints(vectors [][]float32, labels []uint64, concurrenc
 	rows := len(vectors)
 	flatVectors := flatten2DArray(vectors)
 
+	// Convert uint64 labels to C.size_t for portable type safety.
+	cLabels := make([]C.size_t, len(labels))
+	for i, l := range labels {
+		cLabels[i] = C.size_t(l)
+	}
+
 	//as a Go []float32 is layout-compatible with a C float[] so we can pass  Go slice directly to the C function as a pointer to its first element.
 	errCode := C.addPoints(idx.index,
 		(*C.float)(unsafe.Pointer(&flatVectors[0])),
 		C.int(rows),
-		(*C.size_t)(unsafe.Pointer(&labels[0])),
+		(*C.size_t)(unsafe.Pointer(&cLabels[0])),
 		C.int(concurrency),
 		C.int(replace))
 
@@ -236,7 +242,7 @@ func (idx *HnswIndex) SearchKNN(vectors [][]float32, topK int, concurrency int) 
 		rowTopk := make([]*SearchResult, topK)
 		for j := 0; j < topK; j++ {
 			r := SearchResult{}
-			r.Label = *(*uint64)(unsafe.Add(unsafe.Pointer(cResult.label), (rowID*topK+j)*C.sizeof_ulong))
+			r.Label = uint64(*(*C.size_t)(unsafe.Add(unsafe.Pointer(cResult.label), (rowID*topK+j)*C.sizeof_size_t)))
 			r.Distance = *(*float32)(unsafe.Add(unsafe.Pointer(cResult.dist), (rowID*topK+j)*C.sizeof_float))
 			rowTopk[j] = &r
 		}
