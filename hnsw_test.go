@@ -17,23 +17,32 @@ const (
 	batchSize = 100
 )
 
-func newTestIndex(batch int, allowRepaceDeleted bool) *HnswIndex {
+func newTestIndex(batch int, allowRepaceDeleted bool) (*HnswIndex, error) {
 	maxElements := batch * batchSize
 
-	index := New(dim, M, efConstruction, 55, uint64(maxElements), Cosine, allowRepaceDeleted)
+	index, err := New(dim, M, efConstruction, 55, uint64(maxElements), Cosine, allowRepaceDeleted)
+	if err != nil {
+		return nil, err
+	}
 
 	for i := 0; i < batch; i++ {
 		points, labels := randomPoints(dim, i*batchSize, batchSize)
-		index.AddPoints(points, labels, 1, false)
+		if err := index.AddPoints(points, labels, 1, false); err != nil {
+			index.Free()
+			return nil, err
+		}
 	}
 
-	return index
+	return index, nil
 }
 
 func TestNewIndex(t *testing.T) {
 	var maxElements uint64 = batchSize * 1
 
-	idx := newTestIndex(1, true)
+	idx, err := newTestIndex(1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer idx.Free()
 
 	if idx.GetMaxElements() != maxElements {
@@ -54,15 +63,25 @@ func TestLoadAndSaveIndex(t *testing.T) {
 	var maxElements uint64 = batchSize * 1
 
 	// setup
-	idx := newTestIndex(1, true)
-	idx.Save(testVectorDB)
+	idx, err := newTestIndex(1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Save(testVectorDB); err != nil {
+		t.Fatal(err)
+	}
 	idx.Free()
 
-	index := Load(testVectorDB, Cosine, dim, uint64(maxElements), true)
+	index, err := Load(testVectorDB, Cosine, dim, uint64(maxElements), true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	index.SetEf(efConstruction)
 	defer index.Free()
 
-	index.Save(testVectorDB)
+	if err := index.Save(testVectorDB); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		deleteDB()
 	})
@@ -71,7 +90,10 @@ func TestLoadAndSaveIndex(t *testing.T) {
 func TestResizeIndex(t *testing.T) {
 	var maxElements uint64 = batchSize * 1
 
-	idx := newTestIndex(1, false)
+	idx, err := newTestIndex(1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer idx.Free()
 
 	if idx.GetMaxElements() != maxElements {
@@ -87,13 +109,15 @@ func TestResizeIndex(t *testing.T) {
 	}
 
 	points, labels := randomPoints(dim, 1*batchSize, batchSize)
-	err := idx.AddPoints(points, labels, 1, false)
+	err = idx.AddPoints(points, labels, 1, false)
 	if err == nil {
 		t.Log(err)
 		t.FailNow()
 	}
 
-	idx.ResizeIndex(maxElements * 2)
+	if err := idx.ResizeIndex(maxElements * 2); err != nil {
+		t.Fatal(err)
+	}
 	if idx.GetMaxElements() != maxElements*2 {
 		t.Fail()
 	}
@@ -112,7 +136,10 @@ func TestResizeIndex(t *testing.T) {
 func TestReplacePoint(t *testing.T) {
 	allowRepaceDeleted := true
 	maxElements := 100
-	index := New(dim, M, efConstruction, 505, uint64(maxElements), Cosine, allowRepaceDeleted)
+	index, err := New(dim, M, efConstruction, 505, uint64(maxElements), Cosine, allowRepaceDeleted)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer index.Free()
 
 	if !index.GetAllowReplaceDeleted() {
@@ -122,14 +149,16 @@ func TestReplacePoint(t *testing.T) {
 	points, labels := randomPoints(dim, 0, maxElements)
 	index.AddPoints(points, labels, 1, false)
 
-	index.MarkDeleted(labels[len(labels)-1])
+	if err := index.MarkDeleted(labels[len(labels)-1]); err != nil {
+		t.Fatal(err)
+	}
 
-	err := index.AddPoints([][]float32{randomPoint(dim)}, []uint64{math.MaxUint64-1}, 1, false)
+	err = index.AddPoints([][]float32{randomPoint(dim)}, []uint64{math.MaxUint64 - 1}, 1, false)
 	if err == nil {
 		t.Fail()
 	}
 
-	err = index.AddPoints([][]float32{randomPoint(dim)}, []uint64{math.MaxUint64-1}, 1, true)
+	err = index.AddPoints([][]float32{randomPoint(dim)}, []uint64{math.MaxUint64 - 1}, 1, true)
 	if err != nil {
 		t.Fail()
 	}
@@ -141,7 +170,10 @@ func TestVectorSearch(t *testing.T) {
 	batchSize := 100
 	maxElements := batchSize * 10000
 
-	index := Load("./example.data", Cosine, dim, uint64(maxElements), true)
+	index, err := Load("./example.data", Cosine, dim, uint64(maxElements), true)
+	if err != nil {
+		t.Skip("example.data not found, skipping: ", err)
+	}
 	index.SetEf(efConstruction)
 	defer index.Free()
 
