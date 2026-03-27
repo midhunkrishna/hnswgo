@@ -21,13 +21,21 @@ func main() {
 
 	var index *hnswgo.HnswIndex
 	if PathExists("./example.data") {
-		index = hnswgo.Load("./example.data", hnswgo.Cosine, dim, uint64(maxElements), true)
+		var err error
+		index, err = hnswgo.Load("./example.data", hnswgo.Cosine, dim, uint64(maxElements), true)
+		if err != nil {
+			panic(err)
+		}
 		index.SetEf(efConstruction)
 		defer index.Free()
 
 	} else {
 		start := time.Now()
-		index = hnswgo.New(dim, M, efConstruction, 432, uint64(maxElements), hnswgo.Cosine, true)
+		var err error
+		index, err = hnswgo.New(dim, M, efConstruction, 432, uint64(maxElements), hnswgo.Cosine, true)
+		if err != nil {
+			panic(err)
+		}
 		defer index.Free()
 
 		for i := 0; i < 100; i++ {
@@ -37,7 +45,9 @@ func main() {
 				panic(err)
 			}
 		}
-		defer index.Save("./example.data")
+		if err := index.Save("./example.data"); err != nil {
+			panic(err)
+		}
 		fmt.Printf("Time elapsed: %f, max label: %d\n", time.Since(start).Seconds(), maxLabel)
 
 	}

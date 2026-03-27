@@ -1,5 +1,6 @@
 // hnsw_wrapper.cpp
 #include <iostream>
+#include <cstring>
 #include "hnswlib/hnswlib.h"
 #include "hnsw_wrapper.h"
 #include <thread>
@@ -8,6 +9,22 @@
 
 
 static std::vector<std::vector<float>> convertTo2DVector(const float* flat_vectors, int rows, int cols);
+
+// Error handling helpers
+static char* copyErrorString(const char* msg) {
+    if (!msg) return nullptr;
+    size_t len = strlen(msg) + 1;
+    char* copy = (char*)malloc(len);
+    if (copy) memcpy(copy, msg, len);
+    return copy;
+}
+
+static void setError(HnswIndex *index, const char* msg) {
+    if (index->last_error) {
+        free(index->last_error);
+    }
+    index->last_error = copyErrorString(msg);
+}
 
 /*
  * replacement for the openmp '#pragma omp parallel for' directive
@@ -95,37 +112,45 @@ public:
     }
 };
 
-HnswIndex *newIndex(spaceType space_type, const int dim, size_t max_elements, int M, int ef_construction, int rand_seed, int allow_replace_deleted)
+HnswIndex *newIndex(spaceType space_type, const int dim, size_t max_elements, int M, int ef_construction, int rand_seed, int allow_replace_deleted, char **err)
 {
-    HnswIndex *index = new HnswIndex;
-    bool normalize = false;
-    hnswlib::SpaceInterface<float> *space;
-    if (space_type == l2)
-    {
-        space = new hnswlib::L2Space(dim);
-    }
-    else if (space_type == ip)
-    {
-        space = new hnswlib::InnerProductSpace(dim);
-    }
-    else if (space_type == cosine)
-    {
-        space = new hnswlib::InnerProductSpace(dim);
-        normalize = true;
-    }
-    else
-    {
-        throw std::runtime_error("Space name must be one of l2, ip, or cosine.");
-    }
+    try {
+        HnswIndex *index = new HnswIndex;
+        index->last_error = nullptr;
+        bool normalize = false;
+        hnswlib::SpaceInterface<float> *space;
+        if (space_type == l2)
+        {
+            space = new hnswlib::L2Space(dim);
+        }
+        else if (space_type == ip)
+        {
+            space = new hnswlib::InnerProductSpace(dim);
+        }
+        else if (space_type == cosine)
+        {
+            space = new hnswlib::InnerProductSpace(dim);
+            normalize = true;
+        }
+        else
+        {
+            delete index;
+            if (err) *err = copyErrorString("Space name must be one of l2, ip, or cosine.");
+            return nullptr;
+        }
 
-    hnswlib::HierarchicalNSW<float> *appr_alg = new hnswlib::HierarchicalNSW<float>(space, max_elements, M, ef_construction, rand_seed, static_cast<bool>(allow_replace_deleted));
+        hnswlib::HierarchicalNSW<float> *appr_alg = new hnswlib::HierarchicalNSW<float>(space, max_elements, M, ef_construction, rand_seed, static_cast<bool>(allow_replace_deleted));
 
-    index->hnsw = (void *)appr_alg;
-    index->dim = dim;
-    index->normalize = normalize;
-    index->space = (void *)space;
-    index->space_type = space_type;
-    return index;
+        index->hnsw = (void *)appr_alg;
+        index->dim = dim;
+        index->normalize = normalize;
+        index->space = (void *)space;
+        index->space_type = space_type;
+        return index;
+    } catch (const std::exception& e) {
+        if (err) *err = copyErrorString(e.what());
+        return nullptr;
+    }
 }
 
 // set efConstruction value.
@@ -141,42 +166,56 @@ size_t indexFileSize(HnswIndex *index)
 }
 
 // Save index to a file.
-void saveIndex(HnswIndex *index, char *location)
+int saveIndex(HnswIndex *index, char *location)
 {
-    ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->saveIndex(location);
+    try {
+        ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->saveIndex(location);
+        return 0;
+    } catch (const std::exception& e) {
+        setError(index, e.what());
+        return 1;
+    }
 }
 
-HnswIndex *loadIndex(char *location, spaceType space_type, int dim, size_t max_elements, int allow_replace_deleted)
+HnswIndex *loadIndex(char *location, spaceType space_type, int dim, size_t max_elements, int allow_replace_deleted, char **err)
 {
-    HnswIndex *index = new HnswIndex;
-    bool normalize = false;
-    hnswlib::SpaceInterface<float> *space;
-    if (space_type == l2)
-    {
-        space = new hnswlib::L2Space(dim);
-    }
-    else if (space_type == ip)
-    {
-        space = new hnswlib::InnerProductSpace(dim);
-    }
-    else if (space_type == cosine)
-    {
-        space = new hnswlib::InnerProductSpace(dim);
-        normalize = true;
-    }
-    else
-    {
-        throw std::runtime_error("Space name must be one of l2, ip, or cosine.");
-    }
+    try {
+        HnswIndex *index = new HnswIndex;
+        index->last_error = nullptr;
+        bool normalize = false;
+        hnswlib::SpaceInterface<float> *space;
+        if (space_type == l2)
+        {
+            space = new hnswlib::L2Space(dim);
+        }
+        else if (space_type == ip)
+        {
+            space = new hnswlib::InnerProductSpace(dim);
+        }
+        else if (space_type == cosine)
+        {
+            space = new hnswlib::InnerProductSpace(dim);
+            normalize = true;
+        }
+        else
+        {
+            delete index;
+            if (err) *err = copyErrorString("Space name must be one of l2, ip, or cosine.");
+            return nullptr;
+        }
 
-    hnswlib::HierarchicalNSW<float> *appr_alg = new hnswlib::HierarchicalNSW<float>(space, location, false, max_elements, static_cast<bool>(allow_replace_deleted));
+        hnswlib::HierarchicalNSW<float> *appr_alg = new hnswlib::HierarchicalNSW<float>(space, location, false, max_elements, static_cast<bool>(allow_replace_deleted));
 
-    index->hnsw = (void *)appr_alg;
-    index->dim = dim;
-    index->normalize = normalize;
-    index->space = (void *)space;
-    index->space_type = space_type;
-    return index;
+        index->hnsw = (void *)appr_alg;
+        index->dim = dim;
+        index->normalize = normalize;
+        index->space = (void *)space;
+        index->space_type = space_type;
+        return index;
+    } catch (const std::exception& e) {
+        if (err) *err = copyErrorString(e.what());
+        return nullptr;
+    }
 }
 
 void normalize_vector(int dim, float *data, float *norm_array)
@@ -215,31 +254,49 @@ int addPoints(HnswIndex *index, const float *flat_vectors, int rows, size_t *lab
             normalize_vector((index->dim), vectors[row].data(), (norm_array.data() + start_idx));
 
             size_t id = *(labels + row);
-            ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->addPoint((void*)(norm_array.data() + start_idx), id, static_cast<bool>(replace_deleted)); 
+            ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->addPoint((void*)(norm_array.data() + start_idx), id, static_cast<bool>(replace_deleted));
             });
 
     } catch (const std::exception& e) {
-        std::cerr << "[hnsw] Exception caught: " << e.what() << std::endl;
-        return 1; // Error code for C
+        setError(index, e.what());
+        return 1;
     }
 
     return 0;
-  
+
 }
 
-void markDeleted(HnswIndex *index, size_t label)
+int markDeleted(HnswIndex *index, size_t label)
 {
-    ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->markDelete(label);
+    try {
+        ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->markDelete(label);
+        return 0;
+    } catch (const std::exception& e) {
+        setError(index, e.what());
+        return 1;
+    }
 }
 
-void unmarkDeleted(HnswIndex *index, size_t label)
+int unmarkDeleted(HnswIndex *index, size_t label)
 {
-    ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->unmarkDelete(label);
+    try {
+        ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->unmarkDelete(label);
+        return 0;
+    } catch (const std::exception& e) {
+        setError(index, e.what());
+        return 1;
+    }
 }
 
-void resizeIndex(HnswIndex *index, size_t new_size)
+int resizeIndex(HnswIndex *index, size_t new_size)
 {
-    ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->resizeIndex(new_size);
+    try {
+        ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->resizeIndex(new_size);
+        return 0;
+    } catch (const std::exception& e) {
+        setError(index, e.what());
+        return 1;
+    }
 }
 
 size_t getMaxElements(HnswIndex *index)
@@ -331,32 +388,43 @@ int getAllowReplaceDeleted(HnswIndex *index) {
    return ((hnswlib::HierarchicalNSW<float> *)index->hnsw)->allow_replace_deleted_;
 }
 
-void getDataByLabel(HnswIndex *index, const size_t label, float* data) {
-    auto vec = ((hnswlib::HierarchicalNSW<float> *)index->hnsw)->getDataByLabel<float>(label);
-    data = vec.data();
+int getDataByLabel(HnswIndex *index, const size_t label, float* data) {
+    try {
+        auto vec = ((hnswlib::HierarchicalNSW<float> *)index->hnsw)->getDataByLabel<float>(label);
+        memcpy(data, vec.data(), sizeof(float) * index->dim);
+        return 0;
+    } catch (const std::exception& e) {
+        setError(index, e.what());
+        return 1;
+    }
 }
 
 void freeHNSW(HnswIndex *index)
 {
-    hnswlib::HierarchicalNSW<float> *ptr = (hnswlib::HierarchicalNSW<float> *)index->hnsw;
-    delete ptr;
+    if (!index) return;
 
-    if (index->space_type == l2)
-    {
-        hnswlib::L2Space *space = (hnswlib::L2Space *)(index->space);
-        delete space;
-    }
-    else if (index->space_type == ip || index->space_type == cosine)
-    {
-        hnswlib::InnerProductSpace *space = (hnswlib::InnerProductSpace *)(index->space);
-        delete space;
-    }
-    else
-    {
-        throw std::runtime_error("Space name must be one of l2, ip, or cosine.");
-    }
+    try {
+        if (index->hnsw) {
+            hnswlib::HierarchicalNSW<float> *ptr = (hnswlib::HierarchicalNSW<float> *)index->hnsw;
+            delete ptr;
+        }
 
-    delete index;
+        if (index->space_type == l2)
+        {
+            hnswlib::L2Space *space = (hnswlib::L2Space *)(index->space);
+            delete space;
+        }
+        else if (index->space_type == ip || index->space_type == cosine)
+        {
+            hnswlib::InnerProductSpace *space = (hnswlib::InnerProductSpace *)(index->space);
+            delete space;
+        }
+
+        if (index->last_error) free(index->last_error);
+        delete index;
+    } catch (...) {
+        // Best effort cleanup -- do not throw through extern "C" boundary
+    }
 }
 
 void freeResult(SearchResult *result)
