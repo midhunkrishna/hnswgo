@@ -37,6 +37,24 @@ func newTestIndex(batch int, allowRepaceDeleted bool) (*HnswIndex, error) {
 	return index, nil
 }
 
+func mustGetMaxElements(t *testing.T, idx *HnswIndex) uint64 {
+	t.Helper()
+	v, err := idx.GetMaxElements()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func mustGetCurrentCount(t *testing.T, idx *HnswIndex) uint64 {
+	t.Helper()
+	v, err := idx.GetCurrentCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
 func TestNewIndex(t *testing.T) {
 	var maxElements uint64 = batchSize * 1
 
@@ -46,7 +64,7 @@ func TestNewIndex(t *testing.T) {
 	}
 	defer idx.Free()
 
-	if idx.GetMaxElements() != maxElements {
+	if mustGetMaxElements(t, idx) != maxElements {
 		t.Fail()
 	}
 
@@ -54,7 +72,7 @@ func TestNewIndex(t *testing.T) {
 		t.Fail()
 	}
 
-	if idx.GetCurrentCount() != maxElements {
+	if mustGetCurrentCount(t, idx) != maxElements {
 		t.Fail()
 	}
 
@@ -77,7 +95,9 @@ func TestLoadAndSaveIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	index.SetEf(efConstruction)
+	if err := index.SetEf(efConstruction); err != nil {
+		t.Fatal(err)
+	}
 	defer index.Free()
 
 	if err := index.Save(testVectorDB); err != nil {
@@ -97,11 +117,11 @@ func TestResizeIndex(t *testing.T) {
 	}
 	defer idx.Free()
 
-	if idx.GetMaxElements() != maxElements {
+	if mustGetMaxElements(t, idx) != maxElements {
 		t.Fail()
 	}
 
-	if idx.GetCurrentCount() != maxElements {
+	if mustGetCurrentCount(t, idx) != maxElements {
 		t.Fail()
 	}
 
@@ -119,11 +139,11 @@ func TestResizeIndex(t *testing.T) {
 	if err := idx.ResizeIndex(maxElements * 2); err != nil {
 		t.Fatal(err)
 	}
-	if idx.GetMaxElements() != maxElements*2 {
+	if mustGetMaxElements(t, idx) != maxElements*2 {
 		t.Fail()
 	}
 
-	if idx.GetCurrentCount() != maxElements {
+	if mustGetCurrentCount(t, idx) != maxElements {
 		t.Fail()
 	}
 
@@ -451,6 +471,106 @@ func TestUnmarkDeleted(t *testing.T) {
 	if len(vec) != testDim {
 		t.Fatalf("expected dim %d, got %d", testDim, len(vec))
 	}
+}
+
+func TestUseAfterFree(t *testing.T) {
+	index, err := New(8, 16, 200, 42, 100, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Add some data before freeing
+	pts, lbls := randomPoints(8, 0, 10)
+	if err := index.AddPoints(pts, lbls, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	index.Free()
+
+	// All methods should return ErrIndexClosed, not panic
+	_, err = index.SearchKNN([][]float32{make([]float32, 8)}, 1, 1)
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("SearchKNN: expected ErrIndexClosed, got %v", err)
+	}
+
+	err = index.AddPoints([][]float32{make([]float32, 8)}, []uint64{0}, 1, false)
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("AddPoints: expected ErrIndexClosed, got %v", err)
+	}
+
+	_, err = index.GetDataByLabel(0)
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("GetDataByLabel: expected ErrIndexClosed, got %v", err)
+	}
+
+	err = index.MarkDeleted(0)
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("MarkDeleted: expected ErrIndexClosed, got %v", err)
+	}
+
+	err = index.UnmarkDeleted(0)
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("UnmarkDeleted: expected ErrIndexClosed, got %v", err)
+	}
+
+	err = index.ResizeIndex(200)
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("ResizeIndex: expected ErrIndexClosed, got %v", err)
+	}
+
+	err = index.Save("/tmp/test_closed.db")
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("Save: expected ErrIndexClosed, got %v", err)
+	}
+
+	err = index.SetEf(100)
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("SetEf: expected ErrIndexClosed, got %v", err)
+	}
+
+	_, err = index.GetMaxElements()
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("GetMaxElements: expected ErrIndexClosed, got %v", err)
+	}
+
+	_, err = index.GetCurrentCount()
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("GetCurrentCount: expected ErrIndexClosed, got %v", err)
+	}
+
+	_, err = index.IndexFileSize()
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("IndexFileSize: expected ErrIndexClosed, got %v", err)
+	}
+}
+
+func TestConcurrentFreeAndSearch(t *testing.T) {
+	index, err := New(8, 16, 200, 42, 100, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	points, labels := randomPoints(8, 0, 50)
+	if err := index.AddPoints(points, labels, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		query := genQuery(8, 1)
+		index.SearchKNN(query, 3, 1) // may get ErrIndexClosed, that's fine
+	}()
+
+	go func() {
+		defer wg.Done()
+		index.Free()
+	}()
+
+	wg.Wait()
+	// Success = no panic or data race
 }
 
 func randomPoints(dim int, startLabel int, batchSize int) ([][]float32, []uint64) {
