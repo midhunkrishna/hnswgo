@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
 	"testing"
 )
 
@@ -166,42 +167,231 @@ func TestReplacePoint(t *testing.T) {
 }
 
 func TestVectorSearch(t *testing.T) {
-	dim := 400
-	batchSize := 100
-	maxElements := batchSize * 10000
+	searchDim := 32
+	batchSz := 100
+	numBatches := 10
+	maxElems := uint64(batchSz * numBatches)
 
-	index, err := Load("./example.data", Cosine, dim, uint64(maxElements), true)
+	index, err := New(searchDim, 16, 200, 42, maxElems, Cosine, false)
 	if err != nil {
-		t.Skip("example.data not found, skipping: ", err)
+		t.Fatal(err)
 	}
-	index.SetEf(efConstruction)
 	defer index.Free()
+	index.SetEf(100)
 
-	query := genQuery(dim, 10)
+	for i := 0; i < numBatches; i++ {
+		points, labels := randomPoints(searchDim, i*batchSz, batchSz)
+		if err := index.AddPoints(points, labels, 1, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	query := genQuery(searchDim, 10)
 	topK := 5
 
 	result, err := index.SearchKNN(query, topK, 1)
 	if err != nil {
-		t.Error(err)
-		t.Fail()
-		return
+		t.Fatal(err)
 	}
 
 	if len(result) != len(query) {
-		t.Fail()
+		t.Fatalf("expected %d result rows, got %d", len(query), len(result))
 	}
 
-	for _, rv := range result {
+	for i, rv := range result {
 		if len(rv) != topK {
-			t.Fail()
-			break
+			t.Fatalf("row %d: expected %d results, got %d", i, topK, len(rv))
 		}
 	}
-
 }
 
 func TestGetVectorData(t *testing.T) {
+	testDim := 8
+	maxElements := uint64(10)
+	index, err := New(testDim, 16, 200, 42, maxElements, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Free()
 
+	vec := make([]float32, testDim)
+	for i := range vec {
+		vec[i] = float32(i) * 1.1
+	}
+	label := uint64(7)
+
+	if err := index.AddPoints([][]float32{vec}, []uint64{label}, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := index.GetDataByLabel(label)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range vec {
+		if got[i] != vec[i] {
+			t.Errorf("dim %d: got %f, want %f", i, got[i], vec[i])
+		}
+	}
+}
+
+func TestErrorPaths(t *testing.T) {
+	t.Run("GetDataByLabel_missing_label", func(t *testing.T) {
+		index, err := New(8, 16, 200, 42, 10, L2, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer index.Free()
+
+		// Add one point so the index is not empty
+		if err := index.AddPoints([][]float32{make([]float32, 8)}, []uint64{0}, 1, false); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = index.GetDataByLabel(999)
+		if err == nil {
+			t.Error("expected error for missing label")
+		}
+	})
+
+	t.Run("AddPoints_wrong_dimension", func(t *testing.T) {
+		index, err := New(8, 16, 200, 42, 10, L2, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer index.Free()
+
+		wrongDimVec := [][]float32{{1.0, 2.0}} // dim=2, index expects 8
+		err = index.AddPoints(wrongDimVec, []uint64{0}, 1, false)
+		if err == nil {
+			t.Error("expected error for wrong dimensions")
+		}
+	})
+
+	t.Run("Load_nonexistent_file", func(t *testing.T) {
+		_, err := Load("/tmp/nonexistent_hnswgo_test.data", L2, 8, 100, false)
+		if err == nil {
+			t.Error("expected error for nonexistent file")
+		}
+	})
+}
+
+func TestConcurrentAccess(t *testing.T) {
+	testDim := 8
+	index, err := New(testDim, 16, 200, 42, 1000, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Free()
+
+	// Pre-populate
+	points, labels := randomPoints(testDim, 0, 100)
+	if err := index.AddPoints(points, labels, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+
+	// Concurrent searches
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			query := genQuery(testDim, 5)
+			_, err := index.SearchKNN(query, 3, 1)
+			if err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+
+	// Concurrent adds
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(batch int) {
+			defer wg.Done()
+			pts, lbls := randomPoints(testDim, 100+batch*10, 10)
+			_ = index.AddPoints(pts, lbls, 1, false)
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func TestMultipleSpaceTypes(t *testing.T) {
+	for _, st := range []struct {
+		name      string
+		spaceType SpaceType
+	}{
+		{"L2", L2},
+		{"IP", IP},
+		{"Cosine", Cosine},
+	} {
+		t.Run(st.name, func(t *testing.T) {
+			index, err := New(8, 16, 200, 42, 100, st.spaceType, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer index.Free()
+
+			points, labels := randomPoints(8, 0, 50)
+			if err := index.AddPoints(points, labels, 1, false); err != nil {
+				t.Fatal(err)
+			}
+
+			query := genQuery(8, 3)
+			results, err := index.SearchKNN(query, 5, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(results) != 3 {
+				t.Fatalf("expected 3 result rows, got %d", len(results))
+			}
+		})
+	}
+}
+
+func TestDoubleFree(t *testing.T) {
+	index, err := New(8, 16, 200, 42, 10, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	index.Free()
+	index.Free() // should not panic
+}
+
+func TestUnmarkDeleted(t *testing.T) {
+	testDim := 8
+	index, err := New(testDim, 16, 200, 42, 100, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Free()
+
+	points, labels := randomPoints(testDim, 0, 50)
+	if err := index.AddPoints(points, labels, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := index.MarkDeleted(0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := index.UnmarkDeleted(0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should be retrievable again
+	vec, err := index.GetDataByLabel(0)
+	if err != nil {
+		t.Fatal("expected to find undeleted label 0:", err)
+	}
+	if len(vec) != testDim {
+		t.Fatalf("expected dim %d, got %d", testDim, len(vec))
+	}
 }
 
 func randomPoints(dim int, startLabel int, batchSize int) ([][]float32, []uint64) {
