@@ -9,8 +9,12 @@ import "C"
 import (
 	"errors"
 	"runtime"
+	"sync"
 	"unsafe"
 )
+
+// ErrIndexClosed is returned when an operation is attempted on a freed index.
+var ErrIndexClosed = errors.New("index is closed")
 
 type SpaceType int
 
@@ -21,7 +25,9 @@ const (
 )
 
 // HnswIndex wraps the C index type and provides a set of useful index manipulation methods.
+// All methods are safe for concurrent use from multiple goroutines.
 type HnswIndex struct {
+	mu    sync.RWMutex
 	index *C.HnswIndex
 }
 
@@ -116,19 +122,34 @@ func Load(location string, spaceType SpaceType, dim int, maxElements uint64, all
 
 // SetEf sets the query time accuracy/speed trade-off, defined by the ef parameter (see doc ALGO_PARAMS.md of hnswlib).
 // Note that the parameter is currently not saved along with the index, so you need to set it manually after loading.
-func (idx *HnswIndex) SetEf(ef int) {
+func (idx *HnswIndex) SetEf(ef int) error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.index == nil {
+		return ErrIndexClosed
+	}
 	C.setEf(idx.index, C.size_t(ef))
+	return nil
 }
 
 // IndexFileSize returns the index file size in bytes.
-func (idx *HnswIndex) IndexFileSize() uint64 {
-	sz := C.indexFileSize(idx.index)
-
-	return uint64(sz)
+func (idx *HnswIndex) IndexFileSize() (uint64, error) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.index == nil {
+		return 0, ErrIndexClosed
+	}
+	return uint64(C.indexFileSize(idx.index)), nil
 }
 
 // Save writes index data to disk.
 func (idx *HnswIndex) Save(location string) error {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.index == nil {
+		return ErrIndexClosed
+	}
+
 	cloc := C.CString(location)
 	defer C.free(unsafe.Pointer(cloc))
 
@@ -140,6 +161,7 @@ func (idx *HnswIndex) Save(location string) error {
 }
 
 // lastError reads and frees the last_error string from the C struct.
+// Caller must hold at least an RLock.
 func (idx *HnswIndex) lastError() string {
 	errPtr := idx.index.last_error
 	if errPtr == nil {
@@ -154,6 +176,12 @@ func (idx *HnswIndex) lastError() string {
 // AddPoints adds points. Updates the point if it is already in the index.
 // If replacement of deleted elements is enabled: replaces previously deleted point if any, updating it with new point.
 func (idx *HnswIndex) AddPoints(vectors [][]float32, labels []uint64, concurrency int, replaceDeleted bool) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.index == nil {
+		return ErrIndexClosed
+	}
+
 	var replace int = 0
 	if replaceDeleted {
 		replace = 1
@@ -211,6 +239,12 @@ func flatten2DArray(vectors [][]float32) []float32 {
 // SearchKNN does a batch query against the index using the provided vectors. concurrency sets the threads to use for searching.
 // For each of the queried vectors, topK SearchResults will be returned if no error occurred.
 func (idx *HnswIndex) SearchKNN(vectors [][]float32, topK int, concurrency int) ([][]*SearchResult, error) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.index == nil {
+		return nil, ErrIndexClosed
+	}
+
 	if len(vectors) <= 0 {
 		return nil, errors.New("invalid vector data")
 	}
@@ -257,6 +291,12 @@ func (idx *HnswIndex) SearchKNN(vectors [][]float32, topK int, concurrency int) 
 // For Cosine space, the returned vector is the normalized version that was stored,
 // not the original input vector.
 func (idx *HnswIndex) GetDataByLabel(label uint64) ([]float32, error) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.index == nil {
+		return nil, ErrIndexClosed
+	}
+
 	vec := make([]float32, idx.index.dim)
 
 	rc := C.getDataByLabel(idx.index, C.size_t(label), (*C.float)(unsafe.Pointer(&vec[0])))
@@ -268,11 +308,22 @@ func (idx *HnswIndex) GetDataByLabel(label uint64) ([]float32, error) {
 
 // GetAllowReplaceDeleted returns the setting of allowReplaceDeleted.
 func (idx *HnswIndex) GetAllowReplaceDeleted() bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.index == nil {
+		return false
+	}
 	return C.getAllowReplaceDeleted(idx.index) > 0
 }
 
 // MarkDeleted marks the element as deleted, so it will be omitted from search results.
 func (idx *HnswIndex) MarkDeleted(label uint64) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.index == nil {
+		return ErrIndexClosed
+	}
+
 	rc := C.markDeleted(idx.index, C.size_t(label))
 	if int(rc) != 0 {
 		return errors.New("markDeleted failed: " + idx.lastError())
@@ -282,6 +333,12 @@ func (idx *HnswIndex) MarkDeleted(label uint64) error {
 
 // UnmarkDeleted unmarks the element as deleted, so it will not be omitted from search results.
 func (idx *HnswIndex) UnmarkDeleted(label uint64) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.index == nil {
+		return ErrIndexClosed
+	}
+
 	rc := C.unmarkDeleted(idx.index, C.size_t(label))
 	if int(rc) != 0 {
 		return errors.New("unmarkDeleted failed: " + idx.lastError())
@@ -291,6 +348,12 @@ func (idx *HnswIndex) UnmarkDeleted(label uint64) error {
 
 // ResizeIndex changes the maximum capacity of the index.
 func (idx *HnswIndex) ResizeIndex(newSize uint64) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if idx.index == nil {
+		return ErrIndexClosed
+	}
+
 	rc := C.resizeIndex(idx.index, C.size_t(newSize))
 	if int(rc) != 0 {
 		return errors.New("resizeIndex failed: " + idx.lastError())
@@ -299,18 +362,30 @@ func (idx *HnswIndex) ResizeIndex(newSize uint64) error {
 }
 
 // GetMaxElements returns the current capacity of the index.
-func (idx *HnswIndex) GetMaxElements() uint64 {
-	return uint64(C.getMaxElements(idx.index))
+func (idx *HnswIndex) GetMaxElements() (uint64, error) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.index == nil {
+		return 0, ErrIndexClosed
+	}
+	return uint64(C.getMaxElements(idx.index)), nil
 }
 
 // GetCurrentCount returns the current number of elements stored in the index.
-func (idx *HnswIndex) GetCurrentCount() uint64 {
-	return uint64(C.getCurrentCount(idx.index))
+func (idx *HnswIndex) GetCurrentCount() (uint64, error) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.index == nil {
+		return 0, ErrIndexClosed
+	}
+	return uint64(C.getCurrentCount(idx.index)), nil
 }
 
 // Free releases resources bound to the index. Should be called when index is destroyed on close.
 // Safe to call multiple times.
 func (idx *HnswIndex) Free() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
 	if idx.index != nil {
 		C.freeHNSW(idx.index)
 		idx.index = nil
