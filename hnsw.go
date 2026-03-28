@@ -1,6 +1,6 @@
 package hnswgo
 
-// #cgo CXXFLAGS: -fPIC -pthread -Wall -std=c++11 -O2 -march=native -I.
+// #cgo CXXFLAGS: -fPIC -pthread -Wall -std=c++11 -O3 -I.
 // #cgo LDFLAGS: -pthread
 // #cgo CFLAGS: -I./
 // #include <stdlib.h>
@@ -38,6 +38,16 @@ type SearchResult struct {
 	Distance float32
 }
 
+// readCError converts and frees a C error string. Returns "unknown error" if ptr is nil.
+func readCError(cErr *C.char) string {
+	if cErr == nil {
+		return "unknown error"
+	}
+	msg := C.GoString(cErr)
+	C.free(unsafe.Pointer(cErr))
+	return msg
+}
+
 // New creates a new HnswIndex with the specified dimension and other parameters. For details please see hnswlib documents.
 // When allowReplaceDeleted is set, deleted elements can be replaced with new added ones.
 func New(dim, M, efConstruction, randSeed int, maxElements uint64, spaceType SpaceType, allowReplaceDeleted bool) (*HnswIndex, error) {
@@ -61,14 +71,7 @@ func New(dim, M, efConstruction, randSeed int, maxElements uint64, spaceType Spa
 	var cErr *C.char
 	cindex := C.newIndex(sType, C.int(dim), C.size_t(maxElements), C.int(M), C.int(efConstruction), C.int(randSeed), C.int(allowReplace), &cErr)
 	if cindex == nil {
-		var errMsg string
-		if cErr != nil {
-			errMsg = C.GoString(cErr)
-			C.free(unsafe.Pointer(cErr))
-		} else {
-			errMsg = "failed to create index"
-		}
-		return nil, errors.New(errMsg)
+		return nil, errors.New(readCError(cErr))
 	}
 
 	idx := &HnswIndex{
@@ -103,14 +106,7 @@ func Load(location string, spaceType SpaceType, dim int, maxElements uint64, all
 	var cErr *C.char
 	cindex := C.loadIndex(cloc, sType, C.int(dim), C.size_t(maxElements), C.int(allowReplace), &cErr)
 	if cindex == nil {
-		var errMsg string
-		if cErr != nil {
-			errMsg = C.GoString(cErr)
-			C.free(unsafe.Pointer(cErr))
-		} else {
-			errMsg = "failed to load index"
-		}
-		return nil, errors.New(errMsg)
+		return nil, errors.New(readCError(cErr))
 	}
 
 	idx := &HnswIndex{
@@ -123,8 +119,8 @@ func Load(location string, spaceType SpaceType, dim int, maxElements uint64, all
 // SetEf sets the query time accuracy/speed trade-off, defined by the ef parameter (see doc ALGO_PARAMS.md of hnswlib).
 // Note that the parameter is currently not saved along with the index, so you need to set it manually after loading.
 func (idx *HnswIndex) SetEf(ef int) error {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
 	if idx.index == nil {
 		return ErrIndexClosed
 	}
@@ -139,7 +135,14 @@ func (idx *HnswIndex) IndexFileSize() (uint64, error) {
 	if idx.index == nil {
 		return 0, ErrIndexClosed
 	}
-	return uint64(C.indexFileSize(idx.index)), nil
+
+	var result C.size_t
+	var cErr *C.char
+	rc := C.indexFileSize(idx.index, &result, &cErr)
+	if int(rc) != 0 {
+		return 0, errors.New("indexFileSize failed: " + readCError(cErr))
+	}
+	return uint64(result), nil
 }
 
 // Save writes index data to disk.
@@ -153,24 +156,12 @@ func (idx *HnswIndex) Save(location string) error {
 	cloc := C.CString(location)
 	defer C.free(unsafe.Pointer(cloc))
 
-	rc := C.saveIndex(idx.index, cloc)
+	var cErr *C.char
+	rc := C.saveIndex(idx.index, cloc, &cErr)
 	if int(rc) != 0 {
-		return errors.New("save failed: " + idx.lastError())
+		return errors.New("save failed: " + readCError(cErr))
 	}
 	return nil
-}
-
-// lastError reads and frees the last_error string from the C struct.
-// Caller must hold at least an RLock.
-func (idx *HnswIndex) lastError() string {
-	errPtr := idx.index.last_error
-	if errPtr == nil {
-		return "unknown error"
-	}
-	msg := C.GoString(errPtr)
-	C.free(unsafe.Pointer(errPtr))
-	idx.index.last_error = nil
-	return msg
 }
 
 // AddPoints adds points. Updates the point if it is already in the index.
@@ -208,16 +199,19 @@ func (idx *HnswIndex) AddPoints(vectors [][]float32, labels []uint64, concurrenc
 		cLabels[i] = C.size_t(l)
 	}
 
-	//as a Go []float32 is layout-compatible with a C float[] so we can pass  Go slice directly to the C function as a pointer to its first element.
+	// A Go []float32 is layout-compatible with a C float[] so we can pass
+	// the Go slice directly to the C function as a pointer to its first element.
+	var cErr *C.char
 	errCode := C.addPoints(idx.index,
 		(*C.float)(unsafe.Pointer(&flatVectors[0])),
 		C.int(rows),
 		(*C.size_t)(unsafe.Pointer(&cLabels[0])),
 		C.int(concurrency),
-		C.int(replace))
+		C.int(replace),
+		&cErr)
 
 	if int(errCode) != 0 {
-		return errors.New("add point failed: " + idx.lastError())
+		return errors.New("add point failed: " + readCError(cErr))
 	}
 
 	return nil
@@ -253,32 +247,36 @@ func (idx *HnswIndex) SearchKNN(vectors [][]float32, topK int, concurrency int) 
 		return nil, errors.New("unmatched dimensions of vector and index")
 	}
 
-	if uint64(topK) > uint64(C.getMaxElements(idx.index)) {
-		return nil, errors.New("topK is larger than maxElements")
+	if uint64(topK) > uint64(C.getCurrentCount(idx.index)) {
+		return nil, errors.New("topK is larger than the number of elements in the index")
 	}
 
 	rows := len(vectors)
 	flatVectors := flatten2DArray(vectors)
+
+	var cErr *C.char
 	cResult := C.searchKnn(idx.index,
 		(*C.float)(unsafe.Pointer(&flatVectors[0])),
 		C.int(rows),
 		C.int(topK),
 		C.int(concurrency),
+		&cErr,
 	)
 
 	if cResult == nil {
-		return nil, errors.New("search failed: internal error")
+		return nil, errors.New("search failed: " + readCError(cErr))
 	}
 	defer C.freeResult(cResult)
 
-	results := make([][]*SearchResult, rows) //the resulting slice
+	allResults := make([]SearchResult, rows*topK)
+	results := make([][]*SearchResult, rows)
 	for rowID := range results {
 		rowTopk := make([]*SearchResult, topK)
 		for j := 0; j < topK; j++ {
-			r := SearchResult{}
-			r.Label = uint64(*(*C.size_t)(unsafe.Add(unsafe.Pointer(cResult.label), (rowID*topK+j)*C.sizeof_size_t)))
-			r.Distance = *(*float32)(unsafe.Add(unsafe.Pointer(cResult.dist), (rowID*topK+j)*C.sizeof_float))
-			rowTopk[j] = &r
+			flat := rowID*topK + j
+			allResults[flat].Label = uint64(*(*C.size_t)(unsafe.Add(unsafe.Pointer(cResult.label), flat*C.sizeof_size_t)))
+			allResults[flat].Distance = *(*float32)(unsafe.Add(unsafe.Pointer(cResult.dist), flat*C.sizeof_float))
+			rowTopk[j] = &allResults[flat]
 		}
 		results[rowID] = rowTopk
 	}
@@ -299,21 +297,22 @@ func (idx *HnswIndex) GetDataByLabel(label uint64) ([]float32, error) {
 
 	vec := make([]float32, idx.index.dim)
 
-	rc := C.getDataByLabel(idx.index, C.size_t(label), (*C.float)(unsafe.Pointer(&vec[0])))
+	var cErr *C.char
+	rc := C.getDataByLabel(idx.index, C.size_t(label), (*C.float)(unsafe.Pointer(&vec[0])), &cErr)
 	if int(rc) != 0 {
-		return nil, errors.New("getDataByLabel failed: " + idx.lastError())
+		return nil, errors.New("getDataByLabel failed: " + readCError(cErr))
 	}
 	return vec, nil
 }
 
 // GetAllowReplaceDeleted returns the setting of allowReplaceDeleted.
-func (idx *HnswIndex) GetAllowReplaceDeleted() bool {
+func (idx *HnswIndex) GetAllowReplaceDeleted() (bool, error) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	if idx.index == nil {
-		return false
+		return false, ErrIndexClosed
 	}
-	return C.getAllowReplaceDeleted(idx.index) > 0
+	return C.getAllowReplaceDeleted(idx.index) > 0, nil
 }
 
 // MarkDeleted marks the element as deleted, so it will be omitted from search results.
@@ -324,9 +323,10 @@ func (idx *HnswIndex) MarkDeleted(label uint64) error {
 		return ErrIndexClosed
 	}
 
-	rc := C.markDeleted(idx.index, C.size_t(label))
+	var cErr *C.char
+	rc := C.markDeleted(idx.index, C.size_t(label), &cErr)
 	if int(rc) != 0 {
-		return errors.New("markDeleted failed: " + idx.lastError())
+		return errors.New("markDeleted failed: " + readCError(cErr))
 	}
 	return nil
 }
@@ -339,9 +339,10 @@ func (idx *HnswIndex) UnmarkDeleted(label uint64) error {
 		return ErrIndexClosed
 	}
 
-	rc := C.unmarkDeleted(idx.index, C.size_t(label))
+	var cErr *C.char
+	rc := C.unmarkDeleted(idx.index, C.size_t(label), &cErr)
 	if int(rc) != 0 {
-		return errors.New("unmarkDeleted failed: " + idx.lastError())
+		return errors.New("unmarkDeleted failed: " + readCError(cErr))
 	}
 	return nil
 }
@@ -354,9 +355,10 @@ func (idx *HnswIndex) ResizeIndex(newSize uint64) error {
 		return ErrIndexClosed
 	}
 
-	rc := C.resizeIndex(idx.index, C.size_t(newSize))
+	var cErr *C.char
+	rc := C.resizeIndex(idx.index, C.size_t(newSize), &cErr)
 	if int(rc) != 0 {
-		return errors.New("resizeIndex failed: " + idx.lastError())
+		return errors.New("resizeIndex failed: " + readCError(cErr))
 	}
 	return nil
 }
@@ -389,5 +391,6 @@ func (idx *HnswIndex) Free() {
 	if idx.index != nil {
 		C.freeHNSW(idx.index)
 		idx.index = nil
+		runtime.SetFinalizer(idx, nil)
 	}
 }

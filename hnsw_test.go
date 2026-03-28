@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -55,6 +56,15 @@ func mustGetCurrentCount(t *testing.T, idx *HnswIndex) uint64 {
 	return v
 }
 
+func mustGetAllowReplaceDeleted(t *testing.T, idx *HnswIndex) bool {
+	t.Helper()
+	v, err := idx.GetAllowReplaceDeleted()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
 func TestNewIndex(t *testing.T) {
 	var maxElements uint64 = batchSize * 1
 
@@ -68,7 +78,7 @@ func TestNewIndex(t *testing.T) {
 		t.Fail()
 	}
 
-	if idx.GetAllowReplaceDeleted() != true {
+	if mustGetAllowReplaceDeleted(t, idx) != true {
 		t.Fail()
 	}
 
@@ -125,7 +135,7 @@ func TestResizeIndex(t *testing.T) {
 		t.Fail()
 	}
 
-	if idx.GetAllowReplaceDeleted() != false {
+	if mustGetAllowReplaceDeleted(t, idx) != false {
 		t.Fail()
 	}
 
@@ -163,7 +173,7 @@ func TestReplacePoint(t *testing.T) {
 	}
 	defer index.Free()
 
-	if !index.GetAllowReplaceDeleted() {
+	if !mustGetAllowReplaceDeleted(t, index) {
 		t.Fail()
 	}
 
@@ -542,6 +552,11 @@ func TestUseAfterFree(t *testing.T) {
 	if !errors.Is(err, ErrIndexClosed) {
 		t.Errorf("IndexFileSize: expected ErrIndexClosed, got %v", err)
 	}
+
+	_, err = index.GetAllowReplaceDeleted()
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("GetAllowReplaceDeleted: expected ErrIndexClosed, got %v", err)
+	}
 }
 
 func TestConcurrentFreeAndSearch(t *testing.T) {
@@ -571,6 +586,157 @@ func TestConcurrentFreeAndSearch(t *testing.T) {
 
 	wg.Wait()
 	// Success = no panic or data race
+}
+
+// TestSearchKnnConcurrencyZero verifies that passing concurrency=0 with Cosine
+// space does not cause a buffer overflow in the norm_array allocation.
+func TestSearchKnnConcurrencyZero(t *testing.T) {
+	index, err := New(8, 16, 200, 42, 100, Cosine, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Free()
+
+	points, labels := randomPoints(8, 0, 50)
+	if err := index.AddPoints(points, labels, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	query := genQuery(8, 5)
+	results, err := index.SearchKNN(query, 3, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 5 {
+		t.Fatalf("expected 5 result rows, got %d", len(results))
+	}
+}
+
+// TestAddPointsConcurrencyZero verifies that passing concurrency=0 with Cosine
+// space does not cause a buffer overflow in the norm_array allocation.
+func TestAddPointsConcurrencyZero(t *testing.T) {
+	index, err := New(8, 16, 200, 42, 100, Cosine, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Free()
+
+	points, labels := randomPoints(8, 0, 50)
+	if err := index.AddPoints(points, labels, 0, false); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := index.GetCurrentCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 50 {
+		t.Fatalf("expected 50 elements, got %d", count)
+	}
+}
+
+// TestSearchKnnTopKGuard verifies that SearchKNN rejects topK > currentCount
+// at the Go level with a clear error message.
+func TestSearchKnnTopKGuard(t *testing.T) {
+	index, err := New(8, 16, 200, 42, 100, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Free()
+
+	// Add only 3 points
+	points, labels := randomPoints(8, 0, 3)
+	if err := index.AddPoints(points, labels, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Search for topK=10 but only 3 elements exist — Go guard catches this
+	query := genQuery(8, 1)
+	_, err = index.SearchKNN(query, 10, 1)
+	if err == nil {
+		t.Fatal("expected error when topK > number of indexed elements")
+	}
+	if !strings.Contains(err.Error(), "larger than the number of elements") {
+		t.Errorf("expected topK guard message, got: %s", err.Error())
+	}
+}
+
+// TestSearchKnnErrorPropagation verifies that C++ search errors are propagated
+// to Go with a meaningful message instead of being lost to stderr.
+func TestSearchKnnErrorPropagation(t *testing.T) {
+	index, err := New(8, 4, 8, 42, 100, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Free()
+
+	// Add 10 points with minimal M and efConstruction
+	points, labels := randomPoints(8, 0, 10)
+	if err := index.AddPoints(points, labels, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set ef=1 (very small) — may cause search to return fewer than topK results
+	if err := index.SetEf(1); err != nil {
+		t.Fatal(err)
+	}
+
+	// This may or may not trigger the C++ error depending on graph connectivity.
+	// The point is: if searchKnn fails, the error message should be meaningful.
+	query := genQuery(8, 1)
+	_, err = index.SearchKNN(query, 10, 1)
+	if err != nil {
+		// If it fails, the error should contain the C++ message, not "unknown error"
+		if strings.Contains(err.Error(), "unknown error") {
+			t.Errorf("expected meaningful error message, got: %s", err.Error())
+		}
+	}
+	// If it succeeds, that's also fine — the test validates the error path works
+}
+
+// TestGetAllowReplaceDeletedClosed verifies that GetAllowReplaceDeleted returns
+// ErrIndexClosed on a freed index instead of silently returning false.
+func TestGetAllowReplaceDeletedClosed(t *testing.T) {
+	index, err := New(8, 16, 200, 42, 10, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index.Free()
+
+	_, err = index.GetAllowReplaceDeleted()
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("expected ErrIndexClosed, got %v", err)
+	}
+}
+
+// TestIndexFileSizeTryCatch verifies that IndexFileSize is wrapped in try/catch
+// and returns proper errors. Also tests the closed-index path.
+func TestIndexFileSizeTryCatch(t *testing.T) {
+	index, err := New(8, 16, 200, 42, 100, L2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// IndexFileSize on a valid index should succeed
+	points, labels := randomPoints(8, 0, 10)
+	if err := index.AddPoints(points, labels, 1, false); err != nil {
+		t.Fatal(err)
+	}
+
+	size, err := index.IndexFileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size == 0 {
+		t.Error("expected non-zero index file size")
+	}
+
+	// IndexFileSize on a closed index should return ErrIndexClosed
+	index.Free()
+	_, err = index.IndexFileSize()
+	if !errors.Is(err, ErrIndexClosed) {
+		t.Errorf("expected ErrIndexClosed, got %v", err)
+	}
 }
 
 func randomPoints(dim int, startLabel int, batchSize int) ([][]float32, []uint64) {

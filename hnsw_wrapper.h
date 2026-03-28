@@ -18,10 +18,7 @@ extern "C"
         spaceType space_type;
         int dim;
         int normalize;
-        char *last_error;
     } HnswIndex;
-
-    //typedef bool (*filter_func)(int label);
 
     // SearchResult holds the multi-vector search result. label and dist are flatted 2d vectors.
     typedef struct
@@ -32,23 +29,20 @@ extern "C"
 
     HnswIndex *newIndex(spaceType space_type, const int dim, size_t max_elements, int M, int ef_construction, int rand_seed, int allow_replace_deleted, char **err);
     void setEf(HnswIndex *index, size_t ef);
-    size_t indexFileSize(HnswIndex *index);
-    int saveIndex(HnswIndex *index, char *location);
+    int indexFileSize(HnswIndex *index, size_t *result, char **err);
+    int saveIndex(HnswIndex *index, char *location, char **err);
     HnswIndex *loadIndex(char *location, spaceType space_type, int dim, size_t max_elements, int allow_replace_deleted, char **err);
 
-    // add multi-vectors and conresponding labels to index. Returning error codes to indicate error;
-    int addPoints(HnswIndex *index, const float *vectors, int rows, size_t *labels, int num_threads, int replace_deleted);
-    int markDeleted(HnswIndex *index, size_t label);
-    int unmarkDeleted(HnswIndex *index, size_t label);
-    int resizeIndex(HnswIndex *index, size_t new_size);
+    int addPoints(HnswIndex *index, const float *vectors, int rows, size_t *labels, int num_threads, int replace_deleted, char **err);
+    int markDeleted(HnswIndex *index, size_t label, char **err);
+    int unmarkDeleted(HnswIndex *index, size_t label, char **err);
+    int resizeIndex(HnswIndex *index, size_t new_size, char **err);
     size_t getMaxElements(HnswIndex *index);
     size_t getCurrentCount(HnswIndex *index);
     int getAllowReplaceDeleted(HnswIndex *index);
-    // SearchResult *searchKnn(HnswIndex *index, float **vectors, int rows, int k, filter_func filter, int num_threads);
-    SearchResult *searchKnn(HnswIndex *index, const float *flat_vectors, int rows, int k, int num_threads);
+    SearchResult *searchKnn(HnswIndex *index, const float *flat_vectors, int rows, int k, int num_threads, char **err);
 
-    // Get the vector value mapped to label and return it by putting its value in data.
-    int getDataByLabel(HnswIndex *index, const size_t label, float *data);
+    int getDataByLabel(HnswIndex *index, const size_t label, float *data, char **err);
     void freeHNSW(HnswIndex *index);
     void freeResult(SearchResult *result);
 
