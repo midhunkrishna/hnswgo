@@ -1,5 +1,4 @@
-// hnsw_wrapper.cpp
-#include <iostream>
+// hnsw_wrapper.cc
 #include <cstring>
 #include "hnswlib/hnswlib.h"
 #include "hnsw_wrapper.h"
@@ -8,9 +7,7 @@
 #include <vector>
 
 
-static std::vector<std::vector<float>> convertTo2DVector(const float* flat_vectors, int rows, int cols);
-
-// Error handling helpers
+// Error handling helper: copies a string into malloc'd memory for return to Go via char **err.
 static char* copyErrorString(const char* msg) {
     if (!msg) return nullptr;
     size_t len = strlen(msg) + 1;
@@ -19,11 +16,13 @@ static char* copyErrorString(const char* msg) {
     return copy;
 }
 
-static void setError(HnswIndex *index, const char* msg) {
-    if (index->last_error) {
-        free(index->last_error);
+// Resolves the effective thread count: clamps to at least 1, falls back to hardware_concurrency.
+static int resolveThreadCount(int num_threads) {
+    if (num_threads <= 0) {
+        num_threads = std::thread::hardware_concurrency();
+        if (num_threads <= 0) num_threads = 1;
     }
-    index->last_error = copyErrorString(msg);
+    return num_threads;
 }
 
 /*
@@ -96,29 +95,15 @@ inline void ParallelFor(size_t start, size_t end, size_t numThreads, Function fn
     }
 }
 
-class CustomFilterFunctor : public hnswlib::BaseFilterFunctor
-{
-    std::function<bool(hnswlib::labeltype)> filter;
-
-public:
-    explicit CustomFilterFunctor(const std::function<bool(hnswlib::labeltype)> &f)
-    {
-        filter = f;
-    }
-
-    bool operator()(hnswlib::labeltype id)
-    {
-        return filter(id);
-    }
-};
-
 HnswIndex *newIndex(spaceType space_type, const int dim, size_t max_elements, int M, int ef_construction, int rand_seed, int allow_replace_deleted, char **err)
 {
+    HnswIndex *index = nullptr;
+    hnswlib::SpaceInterface<float> *space = nullptr;
+
     try {
-        HnswIndex *index = new HnswIndex;
-        index->last_error = nullptr;
+        index = new HnswIndex;
         bool normalize = false;
-        hnswlib::SpaceInterface<float> *space;
+
         if (space_type == l2)
         {
             space = new hnswlib::L2Space(dim);
@@ -148,6 +133,8 @@ HnswIndex *newIndex(spaceType space_type, const int dim, size_t max_elements, in
         index->space_type = space_type;
         return index;
     } catch (const std::exception& e) {
+        delete space;
+        delete index;
         if (err) *err = copyErrorString(e.what());
         return nullptr;
     }
@@ -159,31 +146,39 @@ void setEf(HnswIndex *index, size_t ef)
     ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->ef_ = ef;
 }
 
-// Returns index file size in size_t.
-size_t indexFileSize(HnswIndex *index)
+// Returns index file size in size_t via out-param. Returns 0 on success, 1 on error.
+int indexFileSize(HnswIndex *index, size_t *result, char **err)
 {
-    return ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->indexFileSize();
+    try {
+        *result = ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->indexFileSize();
+        return 0;
+    } catch (const std::exception& e) {
+        if (err) *err = copyErrorString(e.what());
+        return 1;
+    }
 }
 
 // Save index to a file.
-int saveIndex(HnswIndex *index, char *location)
+int saveIndex(HnswIndex *index, char *location, char **err)
 {
     try {
         ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->saveIndex(location);
         return 0;
     } catch (const std::exception& e) {
-        setError(index, e.what());
+        if (err) *err = copyErrorString(e.what());
         return 1;
     }
 }
 
 HnswIndex *loadIndex(char *location, spaceType space_type, int dim, size_t max_elements, int allow_replace_deleted, char **err)
 {
+    HnswIndex *index = nullptr;
+    hnswlib::SpaceInterface<float> *space = nullptr;
+
     try {
-        HnswIndex *index = new HnswIndex;
-        index->last_error = nullptr;
+        index = new HnswIndex;
         bool normalize = false;
-        hnswlib::SpaceInterface<float> *space;
+
         if (space_type == l2)
         {
             space = new hnswlib::L2Space(dim);
@@ -213,12 +208,14 @@ HnswIndex *loadIndex(char *location, spaceType space_type, int dim, size_t max_e
         index->space_type = space_type;
         return index;
     } catch (const std::exception& e) {
+        delete space;
+        delete index;
         if (err) *err = copyErrorString(e.what());
         return nullptr;
     }
 }
 
-void normalize_vector(int dim, float *data, float *norm_array)
+static void normalize_vector(int dim, const float *data, float *norm_array)
 {
     float norm = 0.0f;
     for (int i = 0; i < dim; i++)
@@ -228,73 +225,73 @@ void normalize_vector(int dim, float *data, float *norm_array)
         norm_array[i] = data[i] * norm;
 }
 
-int addPoints(HnswIndex *index, const float *flat_vectors, int rows, size_t *labels, int num_threads, int replace_deleted)
+int addPoints(HnswIndex *index, const float *flat_vectors, int rows, size_t *labels, int num_threads, int replace_deleted, char **err)
 {
-    // avoid using threads when the number of additions is small:
-    if (rows <= num_threads * 4)
-    {
-        num_threads = 1;
-    }
-
-    std::vector<std::vector<float>> vectors = convertTo2DVector(flat_vectors, rows, index->dim);
-
     try {
+        num_threads = resolveThreadCount(num_threads);
+
+        // avoid using threads when the number of additions is small:
+        if (rows <= num_threads * 4)
+        {
+            num_threads = 1;
+        }
+
+        int d = index->dim;
+
         if (index->normalize == false) {
             ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                 size_t id = *(labels + row);
-                ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->addPoint(vectors[row].data(), id, static_cast<bool>(replace_deleted));
+                ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->addPoint(flat_vectors + row * d, id, static_cast<bool>(replace_deleted));
             });
             return 0;
         }
 
-        std::vector<float> norm_array(num_threads * (index->dim));
+        std::vector<float> norm_array(num_threads * d);
         ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId){
-            // normalize vector:
-            size_t start_idx = threadId * (index->dim);
-            normalize_vector((index->dim), vectors[row].data(), (norm_array.data() + start_idx));
+            size_t start_idx = threadId * d;
+            normalize_vector(d, flat_vectors + row * d, norm_array.data() + start_idx);
 
             size_t id = *(labels + row);
             ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->addPoint((void*)(norm_array.data() + start_idx), id, static_cast<bool>(replace_deleted));
             });
 
     } catch (const std::exception& e) {
-        setError(index, e.what());
+        if (err) *err = copyErrorString(e.what());
         return 1;
     }
 
     return 0;
-
 }
 
-int markDeleted(HnswIndex *index, size_t label)
+int markDeleted(HnswIndex *index, size_t label, char **err)
 {
     try {
         ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->markDelete(label);
         return 0;
     } catch (const std::exception& e) {
-        setError(index, e.what());
+        if (err) *err = copyErrorString(e.what());
         return 1;
     }
 }
 
-int unmarkDeleted(HnswIndex *index, size_t label)
+int unmarkDeleted(HnswIndex *index, size_t label, char **err)
 {
     try {
         ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->unmarkDelete(label);
         return 0;
     } catch (const std::exception& e) {
-        setError(index, e.what());
+        if (err) *err = copyErrorString(e.what());
         return 1;
     }
 }
 
-int resizeIndex(HnswIndex *index, size_t new_size)
+int resizeIndex(HnswIndex *index, size_t new_size, char **err)
 {
     try {
         ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->resizeIndex(new_size);
         return 0;
     } catch (const std::exception& e) {
-        setError(index, e.what());
+        if (err) *err = copyErrorString(e.what());
         return 1;
     }
 }
@@ -309,38 +306,30 @@ size_t getCurrentCount(HnswIndex *index)
     return ((hnswlib::HierarchicalNSW<float> *)(index->hnsw))->cur_element_count;
 }
 
-SearchResult *searchKnn(HnswIndex *index, const float *flat_vectors, int rows, int k, int num_threads)
+SearchResult *searchKnn(HnswIndex *index, const float *flat_vectors, int rows, int k, int num_threads, char **err)
 {
-    //CustomFilterFunctor idFilter(filter);
-    //CustomFilterFunctor *p_idFilter = filter ? &idFilter : nullptr;
-
-    // avoid using threads when the number of searches is small:
-    if (rows <= num_threads * 4)
-    {
-        num_threads = 1;
-    }
-
-    std::vector<std::vector<float>> vectors = convertTo2DVector(flat_vectors, rows, index->dim);
-
-    SearchResult *searchResult = new SearchResult;
-    if (!searchResult) {
-        return nullptr; // Allocation failure
-    }
-    searchResult->label = new hnswlib::labeltype[rows * k];
-    searchResult->dist = new float[rows * k];
-    if (!searchResult->label || !searchResult->dist) {
-        delete[] searchResult->label;
-        delete[] searchResult->dist;
-        delete searchResult;
-        return nullptr; // Allocation failure
-    }
-
-
+    SearchResult *searchResult = nullptr;
     try {
+        num_threads = resolveThreadCount(num_threads);
+
+        // avoid using threads when the number of searches is small:
+        if (rows <= num_threads * 4)
+        {
+            num_threads = 1;
+        }
+
+        int d = index->dim;
+
+        searchResult = new SearchResult;
+        searchResult->label = nullptr;
+        searchResult->dist = nullptr;
+        searchResult->label = new hnswlib::labeltype[rows * k];
+        searchResult->dist = new float[rows * k];
+
         if (index->normalize == false) {
             ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
                 std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
-                    ((hnswlib::HierarchicalNSW<float> *)index->hnsw)->searchKnn(vectors[row].data(), k, nullptr);
+                    ((hnswlib::HierarchicalNSW<float> *)index->hnsw)->searchKnn(flat_vectors + row * d, k, nullptr);
 
                 if (result.size() != (size_t)k)
                     throw std::runtime_error("Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
@@ -354,10 +343,10 @@ SearchResult *searchKnn(HnswIndex *index, const float *flat_vectors, int rows, i
             });
 
         } else {
-            std::vector<float> norm_array(num_threads * (index->dim));
+            std::vector<float> norm_array(num_threads * d);
             ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
-                size_t start_idx = threadId * (index->dim);
-                normalize_vector((index->dim), vectors[row].data(), (norm_array.data() + start_idx));
+                size_t start_idx = threadId * d;
+                normalize_vector(d, flat_vectors + row * d, norm_array.data() + start_idx);
 
                 std::priority_queue<std::pair<float, hnswlib::labeltype>> result =
                     ((hnswlib::HierarchicalNSW<float> *)index->hnsw)->searchKnn((void*)(norm_array.data() + start_idx), k, nullptr);
@@ -373,28 +362,30 @@ SearchResult *searchKnn(HnswIndex *index, const float *flat_vectors, int rows, i
                 }
             });
         }
+
+        return searchResult;
     } catch (const std::exception& e) {
-        std::cerr << "[hnsw] searchKnn exception: " << e.what() << std::endl;
-        delete[] searchResult->label;
-        delete[] searchResult->dist;
-        delete searchResult;
+        if (searchResult) {
+            delete[] searchResult->label;
+            delete[] searchResult->dist;
+            delete searchResult;
+        }
+        if (err) *err = copyErrorString(e.what());
         return nullptr;
     }
-
-    return searchResult;
 }
 
 int getAllowReplaceDeleted(HnswIndex *index) {
    return ((hnswlib::HierarchicalNSW<float> *)index->hnsw)->allow_replace_deleted_;
 }
 
-int getDataByLabel(HnswIndex *index, const size_t label, float* data) {
+int getDataByLabel(HnswIndex *index, const size_t label, float* data, char **err) {
     try {
         auto vec = ((hnswlib::HierarchicalNSW<float> *)index->hnsw)->getDataByLabel<float>(label);
         memcpy(data, vec.data(), sizeof(float) * index->dim);
         return 0;
     } catch (const std::exception& e) {
-        setError(index, e.what());
+        if (err) *err = copyErrorString(e.what());
         return 1;
     }
 }
@@ -405,22 +396,18 @@ void freeHNSW(HnswIndex *index)
 
     try {
         if (index->hnsw) {
-            hnswlib::HierarchicalNSW<float> *ptr = (hnswlib::HierarchicalNSW<float> *)index->hnsw;
-            delete ptr;
+            delete (hnswlib::HierarchicalNSW<float> *)index->hnsw;
         }
 
         if (index->space_type == l2)
         {
-            hnswlib::L2Space *space = (hnswlib::L2Space *)(index->space);
-            delete space;
+            delete (hnswlib::L2Space *)(index->space);
         }
         else if (index->space_type == ip || index->space_type == cosine)
         {
-            hnswlib::InnerProductSpace *space = (hnswlib::InnerProductSpace *)(index->space);
-            delete space;
+            delete (hnswlib::InnerProductSpace *)(index->space);
         }
 
-        if (index->last_error) free(index->last_error);
         delete index;
     } catch (...) {
         // Best effort cleanup -- do not throw through extern "C" boundary
@@ -429,17 +416,8 @@ void freeHNSW(HnswIndex *index)
 
 void freeResult(SearchResult *result)
 {
+    if (!result) return;
     delete[] result->label;
     delete[] result->dist;
     delete result;
-}
-
-static std::vector<std::vector<float>> convertTo2DVector(const float* flat_vectors, int rows, int cols) {
-    std::vector<std::vector<float>> vectors(rows, std::vector<float>(cols));
-    for (int i = 0; i < rows; ++i) {
-        for (int j = 0; j < cols; ++j) {
-            vectors[i][j] = flat_vectors[i * cols + j];
-        }
-    }
-    return vectors;
 }
